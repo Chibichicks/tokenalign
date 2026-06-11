@@ -1,6 +1,6 @@
 [package]
 name = "tokenalign"
-version = "1.0.1"
+version = "1.0.3"
 edition = "2021"
 
 [dependencies]
@@ -9,18 +9,12 @@ tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.11", features = ["json", "stream"] }
-axum-server = "0.6"
 http = "1"
-tower-http = { version = "0.5", features = ["fs", "cors"] }
+tower-http = { version = "0.5", features = ["fs", "cors", "trace"] }
 tiktoken-rs = "0.5"
 machineid-rs = "0.1"
-chrono = "0.4"
 sha2 = "0.10"
-uuid = { version = "1", features = ["v4"] }
-
-[lib]
-name = "tokenalign_lib"
-path = "src/lib.rs"
+futures-util = "0.3"
 
 [[bin]]
 name = "tokenalign"

@@ -1,8 +1,8 @@
 use axum::{
     body::Body,
     extract::{Request, State},
-    http::{header, StatusCode},
-    response::{IntoResponse, Response},
+    http::StatusCode,
+    response::IntoResponse,
     routing::post,
     Router,
 };
@@ -32,50 +32,50 @@ async fn main() {
         .with_state(state);
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
-    let addr = SocketAddr::from(([127, 0, 0, 1], port.parse().unwrap()));
-    println!("🛡️ TokenAlign v37 [Production Candidate]");
-    println!("🚀 Token-Saving Gateway active on http://{}", addr);
-    println!("💎 Strategy: Atomic Alignment + Structural Cache Sync");
-    axum_server::bind(addr)
-        .serve(app.into_make_service())
-        .await
-        .unwrap();
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    
+    println!("🛡️ TokenAlign v1.0.4 [Final Build]");
+    println!("🚀 Proxy Gateway active on http://{}", addr);
+
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
 }
 
 async fn proxy_handler(
     State(state): State<Arc<AppState>>,
-    req: Request<Body>,
-) -> impl IntoResponse {
-    // 1. Extract Target and Model
+    req: Request,
+) -> Response {
     let (parts, body) = req.into_parts();
     let path = parts.uri.path().to_string();
     
-    // 2. Only optimize Chat Completions
     if !path.ends_with("/chat/completions") {
         return envoy::forward_raw(parts, body).await;
     }
 
-    // 3. Transform Request (The Magic)
-    let body_bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
-    let mut json_body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    let body_bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
+
+    let mut json_body: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+        Ok(val) => val,
+        Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+    };
     
     let model = json_body["model"].as_str().unwrap_or("unknown").to_string();
     let geometry = state.discovery.get_geometry(&model).await;
 
-    // Apply DCR (Differential Context Re-ordering)
     json_body = dcr::align_history(json_body, &geometry);
-
-    // Apply WASM Enclave Strategy (Hidden Logic)
     json_body = wasm_enclave::execute(json_body, &geometry).await;
 
-    // 4. Forward to Provider
     let response = envoy::forward_json(parts, json_body).await;
 
-    // 5. Billing & Attestation (Async)
     let billing_clone = state.billing.clone();
     tokio::spawn(async move {
         billing_clone.process_response(response).await;
     });
 
-    StatusCode::OK.into_response() // Simplified for now
+    StatusCode::OK.into_response()
 }
+
+use axum::response::Response;
