@@ -1,0 +1,16 @@
+{
+  "name": "tokenalign",
+  "version": "1.0.0",
+  "description": "TokenAlign: The Sovereign Gateway for LLM Cost Optimization",
+  "scripts": {
+    "build:wasm": "cargo build --target wasm32-unknown-unknown --release",
+    "build:bin": "cargo build --release",
+    "test": "cargo test"
+  },
+  "dependencies": {
+    "axum": "0.7",
+    "tokio": { "version": "1", "features": ["full"] },
+    "serde": { "version": "1", "features": ["derive"] },
+    "reqwest": { "version": "0.11", "features": ["json", "stream"] }
+  }
+}

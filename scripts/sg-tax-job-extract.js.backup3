@@ -1,0 +1,996 @@
+#!/usr/bin/env node
+/**
+ * SG Tax Job Extraction Script
+ * 
+ * A deterministic Playwright-based extraction script for Singapore tax jobs.
+ * Sources:
+ *   1. MyCareersFuture.gov.sg (primary, 113+ tax jobs, no auth required)
+ *   2. LinkedIn (secondary, browser-based extraction with real job IDs)
+ * 
+ * Usage:
+ *   node sg-tax-job-extract.js [options]
+ * 
+ * Options:
+ *   --force              Force LinkedIn extraction even if known IDs >= 10
+ *   --linkedin           Run LinkedIn extraction (default: only if state has < 10 known IDs)
+ *   --mcf-only           Only extract from MyCareersFuture (skip LinkedIn entirely)
+ *   --max-pages N        Max search result pages to extract from MCF (default: 3)
+ *   --state-file         Path to the state JSON file
+ *   --output-dir         Output directory for job results
+ *   --markdown           Output Discord-ready markdown report instead of JSON
+ *   --update-tracking    Update the persistent Obsidian tracking table (implies --markdown)
+ *   --tracking-file      Path to the master tracking markdown file
+ *   --verbose            Print detailed extraction info
+ */
+
+const { chromium } = require('playwright');
+const fs = require('fs');
+const path = require('path');
+
+// ─── Configuration ───────────────────────────────────────────────────────────
+
+let stateFilePath = path.resolve('/home/lucas/.hermes/cron/job_search_state.json');
+let outputDir = path.resolve('/home/lucas/Documents/Obsidian Vault/Hermes Reports');
+let trackingFilePath = path.resolve('/home/lucas/Documents/Obsidian Vault/Job Tracking/sg-tax-master-track.md');
+
+const MCF_SEARCH_URL = 'https://www.mycareersfuture.gov.sg/search?search=tax&sortBy=newest&page=0';
+
+// Multiple LinkedIn search keyword variations to maximize coverage.
+// Each keyword returns a different result set from LinkedIn's search engine.
+// The cron rotates through these across hourly runs.
+const LINKEDIN_SEARCH_QUERIES = [
+  { keywords: 'tax', label: 'tax' },
+  { keywords: 'tax+manager', label: 'tax manager' },
+  { keywords: 'tax+director', label: 'tax director' },
+  { keywords: 'corporate+tax', label: 'corporate tax' },
+  { keywords: 'indirect+tax', label: 'indirect tax' },
+  { keywords: 'transfer+pricing', label: 'transfer pricing' },
+  { keywords: 'taxation', label: 'taxation' },
+  { keywords: 'GST', label: 'GST' },
+  { keywords: 'tax+compliance', label: 'tax compliance' },
+  { keywords: 'international+tax', label: 'international tax' },
+];
+
+const KNOWN_LINKEDIN_JOB_IDS = [
+  { id: '4412285357', company: 'Hudson Singapore', title: 'Tax Director' },
+  { id: '4408644054', company: 'LVMH Fashion Group', title: 'Tax Manager' },
+  { id: '4140697828', company: 'RSM Singapore', title: 'Associate Corporate Tax' },
+  { id: '4409799585', company: 'Baker McKenzie', title: 'Junior Associate Tax' },
+  { id: '4413255912', company: 'Louis Vuitton', title: 'Indirect Tax Specialist' },
+];
+
+// ─── Industry Classification ─────────────────────────────────────────────────
+// Ported from the original Python workflows
+
+function classifyIndustry(company) {
+  const c = (company || '').toLowerCase();
+  const map = [
+    { keywords: ['bank', 'dbs', 'ocbc', 'uob', 'hsbc', 'citibank', 'nomura', 'goldman sachs', 'j.p. morgan', 'morgan stanley', 'ing '], industry: 'Banking & Finance' },
+    { keywords: ['pwc', 'kpmg', 'deloitte', 'ey', 'rsm', 'forvis', 'randstad', 'hudson', 'rgf', 'acca', 'baker mckenzie', 'allen & gledhill'], industry: 'Professional Services' },
+    { keywords: ['lvmh', 'louis vuitton', 'dior', 'fendi', 'gucci', 'prada', 'hermes'], industry: 'Luxury Goods' },
+    { keywords: ['temasek', 'gic', 'schroders', 'blackrock', 'vanguard', 'fidelity'], industry: 'Financial Services' },
+    { keywords: ['apple', 'microsoft', 'google', 'amazon', 'meta', 'byte', 'oracle', 'salesforce', 'adobe', 'reolink', 'aiper', 'oppo'], industry: 'Technology' },
+    { keywords: ['exxonmobil', 'shell', 'bp', 'chevron', 'total'], industry: 'Oil & Gas' },
+    { keywords: ['singapore airlines', 'scoot'], industry: 'Aviation' },
+    { keywords: ['grab', 'gojek'], industry: 'Technology/Transportation' },
+    { keywords: ['ntuc', 'fairprice'], industry: 'Retail/Cooperative' },
+    { keywords: ['straitsx', 'dayone', 'coins', 'circle'], industry: 'Financial Technology' },
+    { keywords: ['marina bay sands', 'genting', 'resorts world'], industry: 'Hospitality/Entertainment' },
+    { keywords: ['dyson', 'versalis', 'stamford land', 'far east organization'], industry: 'Real Estate/Manufacturing' },
+    { keywords: ['swire', 'coca-cola'], industry: 'Beverages/Consumer' },
+    { keywords: ['micron', 'applied materials', 'asml', 'ams'], industry: 'Semiconductor/Technology' },
+  ];
+  for (const entry of map) {
+    if (entry.keywords.some(k => c.includes(k))) return entry.industry;
+  }
+  return 'Corporate / Other';
+}
+
+// ─── State Management ────────────────────────────────────────────────────────
+
+function loadState() {
+  try {
+    if (fs.existsSync(stateFilePath)) {
+      return JSON.parse(fs.readFileSync(stateFilePath, 'utf-8'));
+    }
+  } catch (e) {
+    // Corrupted state file, start fresh
+  }
+  return {
+    version: 1,
+    known_linkedin_jobs: KNOWN_LINKEDIN_JOB_IDS.map(j => ({ ...j, last_verified: null, times_failed: 0 })),
+    reported_urls: [],
+    last_mcf_count: 0,
+    consecutive_zero_mcf: 0,
+    last_run_at: null,
+  };
+}
+
+function saveState(state) {
+  const dir = path.dirname(stateFilePath);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  state.last_run_at = new Date().toISOString();
+  fs.writeFileSync(stateFilePath, JSON.stringify(state, null, 2));
+  return state;
+}
+
+// ─── Tracking Table Management ───────────────────────────────────────────────
+// Reads, parses, merges, and writes the persistent Obsidian tracking table.
+// The table has columns:
+//   # | Date Found | Company | Industry | Position | Date Posted | URL | Comments | Date Applied | Status
+// User edits Comments, Date Applied, Status in Obsidian. Script only appends new rows.
+
+function parseTrackingTable(content) {
+  // Parse markdown table into array of row objects
+  // Returns: { rows: [...], knownUrls: Set<string> }
+  const rows = [];
+  const knownUrls = new Set();
+  
+  const lines = content.split('\n');
+  let inTable = false;
+  let headerLine = null;
+  
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    
+    // Detect table start by finding header row with our columns
+    if (line.startsWith('|') && line.includes('Date Found') && line.includes('URL')) {
+      inTable = true;
+      headerLine = line;
+      continue;
+    }
+    
+    // Skip separator row (---|---|---)
+    if (inTable && line.startsWith('|') && line.includes('---')) {
+      continue;
+    }
+    
+    // Parse data rows
+    if (inTable && line.startsWith('|') && line.endsWith('|')) {
+      // Check if it's an empty template row
+      if (line.replace(/\|/g, '').trim() === '') {
+        continue;
+      }
+      
+      const cells = parseTableRow(line);
+      if (cells.length >= 9) {
+        // Extract URL from the [Link](url) format
+        const urlCell = cells[6] || '';
+        const urlMatch = urlCell.match(/\[.*?\]\((.*?)\)/);
+        const url = urlMatch ? urlMatch[1] : urlCell;
+        
+        if (url) knownUrls.add(url);
+        
+        rows.push({
+          index: cells[0] || '',
+          dateFound: cells[1] || '',
+          company: cells[2] || '',
+          industry: cells[3] || '',
+          position: cells[4] || '',
+          datePosted: cells[5] || '',
+          url: url,
+          comments: cells[7] || '',
+          dateApplied: cells[8] || '',
+          status: cells[9] || '',
+        });
+      }
+    } else if (inTable && !line.startsWith('|')) {
+      // We've left the table
+      inTable = false;
+    }
+  }
+  
+  return { rows, knownUrls };
+}
+
+function parseTableRow(line) {
+  // Parse a markdown table row into cells, handling escaped pipes
+  const cells = [];
+  let current = '';
+  let inLink = false;
+  
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '[') inLink = true;
+    if (ch === ']') inLink = false;
+    
+    if (ch === '|' && !inLink) {
+      cells.push(current.trim());
+      current = '';
+    } else {
+      current += ch;
+    }
+  }
+  // Push last cell (after final |)
+  if (current.trim()) cells.push(current.trim());
+  // Remove first empty cell (before first |)
+  if (cells.length > 0 && cells[0] === '') cells.shift();
+  // Remove last cell if it's empty (trailing |)
+  if (cells.length > 0 && cells[cells.length - 1] === '') cells.pop();
+  
+  return cells;
+}
+
+function escapeTableCell(text) {
+  // Escape pipes in cell content for markdown tables
+  return (text || '').replace(/\|/g, '\\|');
+}
+
+function formatTrackingRows(rows) {
+  // Format rows array back into markdown table lines (excluding header)
+  return rows.map(r => {
+    const urlCell = r.url ? `[Link](${r.url})` : '';
+    return `| ${escapeTableCell(r.index)} | ${escapeTableCell(r.dateFound)} | ${escapeTableCell(r.company)} | ${escapeTableCell(r.industry)} | ${escapeTableCell(r.position)} | ${escapeTableCell(r.datePosted)} | ${urlCell} | ${escapeTableCell(r.comments)} | ${escapeTableCell(r.dateApplied)} | ${escapeTableCell(r.status)} |`;
+  }).join('\n');
+}
+
+function updateTrackingTable(newJobs, dateFound) {
+  // Read existing tracking table, merge new jobs, write back
+  let existingContent = '';
+  let preamble = '';
+  let existingRows = [];
+  let knownUrls = new Set();
+  
+  const dir = path.dirname(trackingFilePath);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+  
+  if (fs.existsSync(trackingFilePath)) {
+    existingContent = fs.readFileSync(trackingFilePath, 'utf-8');
+    const parsed = parseTrackingTable(existingContent);
+    existingRows = parsed.rows;
+    knownUrls = parsed.knownUrls;
+    
+    // Extract preamble (everything before the table, including header and separator rows)
+    const tableStart = existingContent.search(/\n\|.*Date Found.*URL.*\|/);
+    if (tableStart >= 0) {
+      let afterHeader = existingContent.indexOf('\n', tableStart) + 1;
+      // Also skip the separator row (---|---|---...)
+      let afterSeparator = existingContent.indexOf('\n', afterHeader);
+      if (afterSeparator < 0) afterSeparator = afterHeader;
+      preamble = existingContent.substring(0, afterSeparator + 1);
+    } else {
+      preamble = existingContent;
+    }
+  }
+  
+  if (!preamble) {
+    preamble = `# SG Tax Job Master Tracking\n\nPersistent tracking table for all tax jobs discovered by Hermes. Edit the **Comments**, **Date Applied**, and **Status** columns directly in Obsidian.\n\n| # | Date Found | Company | Industry | Position | Date Posted | URL | Comments | Date Applied | Status |\n|---|---|---|---|---|---|---|---|---|---|\n`;
+  }
+  
+  // Find new jobs not already in the tracking table
+  let newCount = 0;
+  let lastIndex = existingRows.length;
+  
+  for (const job of newJobs) {
+    if (!job.url || knownUrls.has(job.url)) continue;
+    
+    lastIndex++;
+    const industry = classifyIndustry(job.company || '');
+    existingRows.push({
+      index: String(lastIndex),
+      dateFound: dateFound,
+      company: job.company || '',
+      industry: industry,
+      position: job.title || '',
+      datePosted: job.posted_date || '',
+      url: job.url,
+      comments: '',
+      dateApplied: '',
+      status: 'New',
+    });
+    knownUrls.add(job.url);
+    newCount++;
+  }
+  
+  // Write back
+  const newContent = preamble + formatTrackingRows(existingRows) + '\n';
+  fs.writeFileSync(trackingFilePath, newContent, 'utf-8');
+  
+  return { newCount, totalRows: existingRows.length };
+}
+
+// ─── MyCareersFuture Extraction ──────────────────────────────────────────────
+
+async function extractMCFJobs(browser, maxPages, verbose) {
+  const page = await browser.newPage();
+  page.setDefaultTimeout(30000);
+  
+  const allJobs = [];
+  const seenUrls = new Set();
+  
+  try {
+    for (let pageNum = 0; pageNum < maxPages; pageNum++) {
+      const url = pageNum === 0
+        ? MCF_SEARCH_URL
+        : MCF_SEARCH_URL.replace('page=0', `page=${pageNum}`);
+      
+      if (verbose) console.log(`[MCF] Navigating to page ${pageNum}: ${url}`);
+      
+      await page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
+      await page.waitForTimeout(3000);
+      
+      // Wait for job cards to render
+      try {
+        await page.waitForSelector('[data-testid="job-card"]', { timeout: 10000 });
+      } catch {
+        // Try fallback selectors
+        try {
+          await page.waitForSelector('[class*="card"]', { timeout: 5000 });
+        } catch {
+          if (verbose) console.log('[MCF] No job cards found on page', pageNum);
+          break;
+        }
+      }
+      
+      // Extract job listings
+      const jobs = await page.evaluate(() => {
+        const results = [];
+        const cards = document.querySelectorAll('[data-testid="job-card"]');
+        
+        for (const card of cards) {
+          // The card is a DIV - find the link inside it
+          const linkEl = card.querySelector('a[href*="/job/"]');
+          const url = linkEl ? linkEl.href : '';
+          
+          // Extract title from the JobCard__jobtitle span
+          const titleEl = card.querySelector('[class*="JobCard__jobtitle"]');
+          const title = titleEl ? titleEl.textContent.trim() : '';
+          
+          // Extract company from p with ttu class (text-transform uppercase = company name)
+          const companyEl = card.querySelector('p[class*="ttu"]');
+          const company = companyEl ? companyEl.textContent.trim() : '';
+          
+          // Extract details from icon-based p tags
+          const locationEl = card.querySelector('[class*="icon-bw-location"]');
+          const location = locationEl ? locationEl.textContent.trim() : '';
+          
+          const typeEl = card.querySelector('[class*="icon-bw-employment"]');
+          const employmentType = typeEl ? typeEl.textContent.trim() : '';
+          
+          const seniorityEl = card.querySelector('[class*="icon-bw-seniority"]');
+          const seniority = seniorityEl ? seniorityEl.textContent.trim() : '';
+          
+          const categoryEl = card.querySelector('[class*="icon-bw-category"]');
+          const category = categoryEl ? categoryEl.textContent.trim() : '';
+          
+          // Experience is in a p that follows the category (may have different class patterns)
+          const expEl = card.querySelector('[class*="years"]') || 
+            Array.from(card.querySelectorAll('p')).find(p => p.textContent.includes('exp'));
+          const minExperience = expEl ? expEl.textContent.trim() : '';
+          
+          // Extract posted date from text like "Posted 7 days ago"
+          const dateEl = card.querySelector('span[class*="i"]');  // italic span = posted date
+          const postedDate = dateEl ? dateEl.textContent.trim() : '';
+          
+          // Extract salary if available
+          const salaryEl = card.querySelector('span[class*="f3-5"]');
+          const salary = salaryEl ? salaryEl.textContent.trim() : '';
+          
+          results.push({
+            title,
+            company,
+            location,
+            employment_type: employmentType,
+            seniority,
+            category,
+            min_experience: minExperience,
+            salary,
+            posted_date: postedDate,
+            url,
+            source: 'MyCareersFuture',
+            validated: !!url && !!title,
+          });
+        }
+        
+        return results;
+      });
+      
+      if (verbose) console.log(`[MCF] Found ${jobs.length} jobs on page ${pageNum}`);
+      
+      // Filter to tax-related jobs and deduplicate by URL
+      for (const job of jobs) {
+        const isTaxRelevant = job.title.toLowerCase().includes('tax') ||
+          job.company.toLowerCase().includes('tax') ||
+          job.seniority?.toLowerCase().includes('tax');
+        
+        if (isTaxRelevant && job.url && !seenUrls.has(job.url)) {
+          seenUrls.add(job.url);
+          allJobs.push(job);
+        }
+      }
+      
+      // Check if there's a next page
+      const hasNext = await page.evaluate(() => {
+        const nextBtn = document.querySelector('[data-testid="pagination-next"], a[rel="next"]');
+        return !!nextBtn && !nextBtn.disabled;
+      }).catch(() => false);
+      
+      if (!hasNext) break;
+    }
+  } catch (e) {
+    if (verbose) console.error('[MCF] Extraction error:', e.message);
+  } finally {
+    await page.close();
+  }
+  
+  return allJobs;
+}
+
+// ─── LinkedIn Extraction ─────────────────────────────────────────────────────
+
+function buildLinkedInUrl(jobId, title, company) {
+  const slug = title.toLowerCase().replace(/[\s\/\(\)]/g, '-').replace(/--+/g, '-').replace(/^-|-$/g, '');
+  const companySlug = company.toLowerCase().replace(/[\s\/\(\)]/g, '-').replace(/--+/g, '-').replace(/^-|-$/g, '');
+  return `https://sg.linkedin.com/jobs/view/${slug}-at-${companySlug}-${jobId}`;
+}
+
+async function validateLinkedInUrl(page, url, verbose) {
+  try {
+    const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    await page.waitForTimeout(2000);
+    const status = resp ? resp.status() : 0;
+    const bodyText = await page.evaluate(() => document.body?.textContent?.slice(0, 300) || '');
+    const is404 = status === 404 || bodyText.includes('Page not found') || bodyText.includes("page doesn't exist");
+    return !is404;
+  } catch {
+    return false;
+  }
+}
+
+async function extractLinkedInJobs(browser, state, flags) {
+  const verbose = flags.verbose;
+  const page = await browser.newPage();
+  page.setDefaultTimeout(30000);
+  
+  const results = [];
+  const LINKEDIN_SCROLL_COUNT = flags.force ? 5 : 3;
+    // Hourly: run 3 queries (rotating through the list based on hour).
+    // Weekly (--force/--linkedin): run all queries.
+   let queriesToRun = [];
+   if (flags.force) {
+     queriesToRun = LINKEDIN_SEARCH_QUERIES; // all queries
+   } else {
+     queriesToRun = selectQueriesForHour(LINKEDIN_SEARCH_QUERIES, 3); // 3 rotating (for --linkedin and hourly)
+   }
+   }
+    
+    
+    let allQueryJobs = [];
+    let allAccessible = true;
+    
+    for (const query of queriesToRun) {
+      const url = `https://sg.linkedin.com/jobs/search/?keywords=${query.keywords}&location=singapore&f_TPR=r2592000`;
+      if (verbose) console.log(`[LI] Navigating to query "${query.label}": ${url}`);
+      
+      await page.goto(url, { 
+        waitUntil: 'domcontentloaded', 
+        timeout: 25000 
+      });
+      await page.waitForTimeout(4000);
+      
+      const pageTitle = await page.title();
+      const pageContent = await page.evaluate(() => document.body?.textContent?.slice(0, 500) || '');
+      
+      const isLoginWall = pageContent.includes('Sign in') && 
+        (pageContent.includes('LinkedIn') || pageTitle.includes('LinkedIn'));
+      
+      if (isLoginWall) {
+        if (verbose) console.log('[LI] LinkedIn sign-in wall detected');
+        allAccessible = false;
+        
+        // Try to dismiss the sign-in dialog if possible
+        try {
+          const dismissBtn = await page.$('button[aria-label="Dismiss"], .modal__dismiss, [data-tracking-control="public_profile__dismiss"]');
+          if (dismissBtn) {
+            await dismissBtn.click();
+            await page.waitForTimeout(2000);
+            if (verbose) console.log('[LI] Dismissed sign-in dialog');
+          }
+        } catch {}
+        
+        // Check if we can still see job listings after dismissing
+        const afterDismissContent = await page.evaluate(() => document.body?.textContent?.slice(0, 500) || '');
+        if (!afterDismissContent.includes('Sign in')) {
+          allAccessible = true;
+          // Scroll to load more results (LinkedIn infinite scroll)
+          const jobs = await extractLinkedInWithScroll(page, query.label, LINKEDIN_SCROLL_COUNT, verbose);
+          allQueryJobs.push(...jobs);
+        }
+      } else {
+        if (verbose) console.log(`[LI] LinkedIn accessible for query "${query.label}"`);
+        // Scroll to load more results (LinkedIn infinite scroll)
+        const jobs = await extractLinkedInWithScroll(page, query.label, LINKEDIN_SCROLL_COUNT, verbose);
+        allQueryJobs.push(...jobs);
+      }
+      
+      // Small delay between queries to avoid rate limiting
+      await page.waitForTimeout(1500);
+    }
+    
+    if (allAccessible) linkedinStatus = 'ok';
+    results.push(...allQueryJobs);
+    
+    // Step 2: Validate known LinkedIn URLs during --linkedin runs
+    // Increment times_failed for URLs that don't resolve
+    if (linkedinStatus === 'ok') {
+      for (const known of state.known_linkedin_jobs) {
+        const url = buildLinkedInUrl(known.id, known.title, known.company);
+        const isValid = await validateLinkedInUrl(page, url, verbose);
+        if (isValid) {
+          known.last_verified = new Date().toISOString().split('T')[0];
+          known.times_failed = Math.max(0, (known.times_failed || 0) - 1);
+        } else {
+          known.times_failed = (known.times_failed || 0) + 1;
+          if (verbose) console.log(`[LI] URL validation failed for ${known.company} - ${known.title} (fail count: ${known.times_failed})`);
+        }
+      }
+      
+      // Prune jobs that failed validation 3+ times
+      const before = state.known_linkedin_jobs.length;
+      state.known_linkedin_jobs = state.known_linkedin_jobs.filter(k => (k.times_failed || 0) < 3);
+      const pruned = before - state.known_linkedin_jobs.length;
+      if (pruned > 0 && verbose) console.log(`[LI] Pruned ${pruned} stale LinkedIn job IDs`);
+    }
+    
+    // Step 3: Include known job IDs from state
+    for (const known of state.known_linkedin_jobs) {
+      const url = buildLinkedInUrl(known.id, known.title, known.company);
+      if (!results.some(r => r.jobId === known.id || r.url === url)) {
+        results.push({
+          jobId: known.id,
+          title: known.title,
+          company: known.company,
+          url,
+          source: 'LinkedIn',
+          validated: true,
+          posted_date: known.last_verified || '',
+          date_identified: known.last_verified || '',
+        });
+      }
+    }
+    
+  } catch (e) {
+    if (verbose) console.error('[LI] Extraction error:', e.message);
+    // Fallback: use known job IDs
+    for (const known of state.known_linkedin_jobs || []) {
+      const url = buildLinkedInUrl(known.id, known.title, known.company);
+      results.push({
+        jobId: known.id,
+        title: known.title,
+        company: known.company,
+        url,
+        source: 'LinkedIn',
+        validated: true,
+        posted_date: known.last_verified || '',
+      });
+    }
+  } finally {
+    await page.close();
+  }
+  
+  return { jobs: results, status: linkedinStatus };
+}
+
+/**
+ * Select N queries from the full list, cycling based on the current hour.
+ * This ensures every hourly run covers different search terms,
+ * and all terms get covered over the course of a day.
+ */
+function selectQueriesForHour(allQueries, count) {
+  const hour = new Date().getHours();
+  const result = [];
+  for (let i = 0; i < count; i++) {
+    const idx = (hour + i) % allQueries.length;
+    result.push(allQueries[idx]);
+  }
+  return result;
+}
+
+/**
+ * Extract LinkedIn jobs from the current page, scrolling to load more results.
+ * LinkedIn uses infinite scroll — we scroll multiple times to surface more jobs.
+ */
+async function extractLinkedInWithScroll(page, label, scrollCount, verbose) {
+  const allJobs = [];
+  const seenUrls = new Set();
+  
+  for (let scroll = 0; scroll < scrollCount; scroll++) {
+    if (verbose) console.log(`[LI][${label}] Scroll ${scroll + 1}/${scrollCount}`);
+    
+    // Wait for results to load after scroll
+    await page.waitForTimeout(2000);
+    
+    // Scroll down to trigger LinkedIn's infinite scroll
+    await page.evaluate(() => {
+      const listContainer = document.querySelector('.jobs-search__results-list, .scaffold-layout__list-container, [class*="results-list"]');
+      if (listContainer) {
+        listContainer.scrollTop = listContainer.scrollHeight;
+      } else {
+        window.scrollBy(0, 800);
+      }
+    });
+    
+    // Wait for new results to load
+    await page.waitForTimeout(2500);
+    
+    // Extract jobs currently visible
+    const jobs = await extractLinkedInFromPage(page, verbose);
+    
+    // Deduplicate within this query
+    for (const job of jobs) {
+      const url = job.url || job.jobId;
+      if (url && !seenUrls.has(url)) {
+        seenUrls.add(url);
+        allJobs.push(job);
+      }
+    }
+    
+    if (verbose) console.log(`[LI][${label}] After scroll ${scroll + 1}: ${allJobs.length} unique jobs`);
+  }
+  
+  return allJobs;
+}
+
+async function extractLinkedInFromPage(page, verbose) {
+  const jobs = await page.evaluate(() => {
+    const results = [];
+    
+    // Try to get the currentJobId from URL
+    const urlParams = new URLSearchParams(window.location.search);
+    const currentJobId = urlParams.get('currentJobId');
+    
+    // Extract job listings from the search results
+    const jobCards = document.querySelectorAll('.job-card-container, [data-job-id], .job-search-card, article');
+    
+    for (const card of jobCards) {
+      const jobId = card.getAttribute('data-job-id') || 
+        card.querySelector('[data-job-id]')?.getAttribute('data-job-id');
+      const linkEl = card.querySelector('a[href*="/jobs/view"]');
+      const href = linkEl ? linkEl.href : '';
+      
+      const titleEl = card.querySelector('.job-card-list__title, .job-card-search__title, .job-title, .base-search-card__title, [class*="title"]');
+      const title = titleEl ? titleEl.textContent.trim() : '';
+      
+      const companyEl = card.querySelector('.job-card-container__company-name, .job-card-search__company-name, .base-search-card__subtitle, [class*="company"]');
+      const company = companyEl ? companyEl.textContent.trim() : '';
+      
+      const locationEl = card.querySelector('.job-card-container__metadata-item, .job-card-search__location, .base-search-card__metadata, [class*="location"]');
+      const location = locationEl ? locationEl.textContent.trim() : '';
+      
+      const dateEl = card.querySelector('.job-card-container__listed-state, time, [class*="date"], [class*="time"]');
+      const postedDate = dateEl ? (dateEl.textContent.trim() || dateEl.getAttribute('datetime') || '') : '';
+      
+      if (title && (jobId || href)) {
+        // Only use the href directly from the page - that's a real LinkedIn URL
+        // For fallback: use simple /jobs/view/{jobId} URL which redirects correctly
+        const url = href || (jobId ? `https://sg.linkedin.com/jobs/view/${jobId}` : '');
+        results.push({
+          jobId: jobId || (href.match(/-(\d+)$/)?.[1] || ''),
+          title,
+          company,
+          location,
+          posted_date: postedDate,
+          url,
+          source: 'LinkedIn',
+          validated: true,
+        });
+      }
+    }
+    
+    // Also extract currentJobId from URL if available
+    // Use https://sg.linkedin.com/jobs/view/{jobId} which LinkedIn auto-redirects correctly
+    if (currentJobId && !results.some(r => r.jobId === currentJobId)) {
+      const titleEl = document.querySelector('.job-details-jobs-unified-top-card__job-title, .top-card-layout__title, [class*="job-title"]');
+      const companyEl = document.querySelector('.job-details-jobs-unified-top-card__company-name, .top-card-layout__second-subtitle, [class*="company"]');
+      results.push({
+        jobId: currentJobId,
+        title: titleEl?.textContent?.trim() || '',
+        company: companyEl?.textContent?.trim() || '',
+        url: `https://sg.linkedin.com/jobs/view/${currentJobId}`,
+        source: 'LinkedIn',
+        validated: true,
+      });
+    }
+    
+    return results;
+  }).catch(() => []);
+  
+  if (verbose) console.log(`[LI] Extracted ${jobs.length} jobs from LinkedIn page`);
+  return jobs;
+}
+
+// ─── Main ────────────────────────────────────────────────────────────────────
+
+async function main() {
+  const args = process.argv.slice(2);
+  const flags = {
+    force: args.includes('--force'),
+    linkedin: args.includes('--linkedin'),
+    mcfOnly: args.includes('--mcf-only'),
+    markdown: args.includes('--markdown'),
+    updateTracking: args.includes('--update-tracking'),
+    maxPages: 3,
+    verbose: args.includes('--verbose'),
+  };
+  
+  // --update-tracking implies --markdown
+  if (flags.updateTracking) flags.markdown = true;
+  
+  const maxPagesIdx = args.indexOf('--max-pages');
+  if (maxPagesIdx >= 0 && maxPagesIdx < args.length - 1) {
+    flags.maxPages = parseInt(args[maxPagesIdx + 1], 10) || 3;
+  }
+  
+  const stateFileIdx = args.indexOf('--state-file');
+  if (stateFileIdx >= 0 && stateFileIdx < args.length - 1) {
+    stateFilePath = path.resolve(args[stateFileIdx + 1]);
+  }
+  
+  const outputDirIdx = args.indexOf('--output-dir');
+  if (outputDirIdx >= 0 && outputDirIdx < args.length - 1) {
+    outputDir = path.resolve(args[outputDirIdx + 1]);
+  }
+  
+  const trackingFileIdx = args.indexOf('--tracking-file');
+  if (trackingFileIdx >= 0 && trackingFileIdx < args.length - 1) {
+    trackingFilePath = path.resolve(args[trackingFileIdx + 1]);
+  }
+  
+  // Load state
+  const state = loadState();
+  
+  // Determine if we need to run LinkedIn extraction.
+  // Now runs every hour (unless --mcf-only) to catch new roles across multiple search terms.
+  // The old <10 guard was removed because it capped discovery — once we knew ~10 jobs,
+  // new ones would be invisible until the weekly forced run, recreating the exact miss problem.
+  const shouldRunLinkedIn = !flags.mcfOnly;
+  
+  if (flags.verbose) {
+    console.log(`[START] Max pages: ${flags.maxPages}, LinkedIn: ${shouldRunLinkedIn}`);
+    console.log(`[START] State has ${state.known_linkedin_jobs.length} known LinkedIn jobs`);
+  }
+  
+  // Launch browser
+  const browser = await chromium.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+  });
+  
+  let allJobs = [];
+  let mcfCount = 0;
+  let liCount = 0;
+  let linkedinStatus = 'skipped';
+  
+  try {
+    // Step 1: MyCareersFuture extraction
+    const mcfJobs = await extractMCFJobs(browser, flags.maxPages, flags.verbose);
+    mcfCount = mcfJobs.length;
+    if (flags.verbose) console.log(`[MCF] Total: ${mcfCount} tax jobs found`);
+    
+    // Step 2: LinkedIn extraction (optional)
+    let liJobs = [];
+    if (shouldRunLinkedIn) {
+      const liResult = await extractLinkedInJobs(browser, state, flags);
+      liJobs = liResult.jobs;
+      liCount = liJobs.length;
+      linkedinStatus = liResult.status;
+      if (flags.verbose) console.log(`[LI] Total: ${liCount} jobs found (status: ${linkedinStatus})`);
+      
+      // Update state with any new job IDs discovered
+      for (const job of liJobs) {
+        if (job.jobId && !state.known_linkedin_jobs.some(k => k.id === job.jobId)) {
+          state.known_linkedin_jobs.push({
+            id: job.jobId,
+            company: job.company,
+            title: job.title,
+            last_verified: new Date().toISOString().split('T')[0],
+            times_failed: 0,
+          });
+        } else if (job.jobId) {
+          const existing = state.known_linkedin_jobs.find(k => k.id === job.jobId);
+          if (existing) {
+            existing.last_verified = new Date().toISOString().split('T')[0];
+            existing.times_failed = Math.max(0, (existing.times_failed || 0) - 1);
+          }
+        }
+      }
+    } else {
+      // Still include known LinkedIn jobs from state for completeness
+      for (const known of state.known_linkedin_jobs) {
+        const slug = known.title.toLowerCase().replace(/[\s\/\(\)]/g, '-').replace(/--+/g, '-').replace(/^-|-$/g, '');
+        const companySlug = known.company.toLowerCase().replace(/[\s\/\(\)]/g, '-').replace(/--+/g, '-').replace(/^-|-$/g, '');
+        const url = `https://sg.linkedin.com/jobs/view/${slug}-at-${companySlug}-${known.id}`;
+        liJobs.push({
+          title: known.title,
+          company: known.company,
+          url,
+          source: 'LinkedIn',
+          validated: true,
+          posted_date: known.last_verified || '',
+        });
+      }
+      liCount = liJobs.length;
+    }
+    
+    allJobs = [...mcfJobs, ...liJobs];
+    
+  } catch (e) {
+    if (flags.verbose) console.error('[FATAL]', e.message);
+  } finally {
+    await browser.close();
+  }
+  
+  // Deduplicate by URL
+  const seenUrls = new Set();
+  const dedupedJobs = allJobs.filter(j => {
+    if (!j.url || seenUrls.has(j.url)) return false;
+    seenUrls.add(j.url);
+    return true;
+  });
+  
+  // Track which URLs are new (not yet reported)
+  const previouslyReported = new Set(state.reported_urls);
+  const newJobs = dedupedJobs.filter(j => !previouslyReported.has(j.url));
+  
+  // Update state with reported URLs (keep last 200 to avoid unbounded growth)
+  for (const job of dedupedJobs) {
+    if (!state.reported_urls.includes(job.url)) {
+      state.reported_urls.push(job.url);
+    }
+  }
+  state.reported_urls = state.reported_urls.slice(-200);
+  
+  // Track consecutive-zero MCF count as extraction health signal (before saveState)
+  const prevMcfCount = state.last_mcf_count;
+  if (mcfCount === 0 && prevMcfCount === 0) {
+    state.consecutive_zero_mcf = (state.consecutive_zero_mcf || 0) + 1;
+  } else if (mcfCount > 0) {
+    state.consecutive_zero_mcf = 0;
+  }
+  
+  // Update MCF count tracking
+  state.last_mcf_count = mcfCount;
+  saveState(state);
+  
+  // Build output object
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const dateIdentified = new Date().toISOString().split('T')[0];
+  
+  const output = {
+    generated_at: new Date().toISOString(),
+    mcf_health: {
+      consecutive_zero_count: state.consecutive_zero_mcf,
+      healthy: state.consecutive_zero_mcf < 3,
+      status: state.consecutive_zero_mcf === 0 ? 'ok' : state.consecutive_zero_mcf < 3 ? 'warning' : 'error',
+    },
+    sources: {
+      mycareersfuture: {
+        jobs_found: mcfCount,
+        status: mcfCount > 0 ? 'ok' : 'empty',
+      },
+      linkedin: {
+        jobs_found: liCount,
+        status: linkedinStatus,
+        known_ids: state.known_linkedin_jobs.length,
+      },
+    },
+    summary: {
+      total_unique_jobs: dedupedJobs.length,
+      new_jobs_this_run: newJobs.length,
+      total_reported_all_time: state.reported_urls.length,
+    },
+    jobs: dedupedJobs.map(j => ({
+      ...j,
+      industry: classifyIndustry(j.company || ''),
+      date_identified: dateIdentified,
+      is_new: !previouslyReported.has(j.url),
+    })),
+  };
+  
+  // Save to output directory
+  const outputPath = path.join(outputDir, `sg-tax-jobs-${timestamp}.json`);
+  if (!fs.existsSync(outputDir)) {
+    fs.mkdirSync(outputDir, { recursive: true });
+  }
+  fs.writeFileSync(outputPath, JSON.stringify(output, null, 2));
+  
+  // Rotate output files: keep only the last 30
+  try {
+    const allFiles = fs.readdirSync(outputDir)
+      .filter(f => f.startsWith('sg-tax-jobs-') && f.endsWith('.json'))
+      .sort()
+      .reverse();
+    if (allFiles.length > 30) {
+      for (const f of allFiles.slice(30)) {
+        fs.unlinkSync(path.join(outputDir, f));
+      }
+      if (flags.verbose) console.error(`[ROTATE] Removed ${allFiles.length - 30} old output files`);
+    }
+  } catch (e) {
+    // Rotation is best-effort
+  }
+  
+  // Update persistent tracking table
+  if (flags.updateTracking) {
+    const trackingResult = updateTrackingTable(newJobs, dateIdentified);
+    if (flags.verbose) {
+      console.error(`[TRACKING] Added ${trackingResult.newCount} new jobs to tracking table (${trackingResult.totalRows} total)`);
+    }
+  }
+  
+  // Output based on mode
+  if (flags.markdown) {
+    // Discord-ready markdown report
+    const date = dateIdentified;
+    let markdown = `**SG Tax Jobs \u2014 ${date}**\n\n`;
+    
+    // Health warning if consecutive zero MCF
+    if (state.consecutive_zero_mcf >= 3) {
+      markdown += `\u26a0\ufe0f **WARNING:** MyCareersFuture has returned 0 jobs for ${state.consecutive_zero_mcf} consecutive runs. Extraction selectors may be broken.\n\n`;
+    }
+    
+    if (newJobs.length > 0) {
+      markdown += `**\u2728 New Jobs This Run (${newJobs.length})**\n\n`;
+      markdown += `| Company | Industry | Position | Posted | Source |\n`;
+      markdown += `|---------|----------|----------|--------|--------|\n`;
+      for (const job of newJobs) {
+        const company = job.company || 'N/A';
+        const industry = classifyIndustry(job.company || '');
+        const title = job.title || 'N/A';
+        const posted = job.posted_date || '';
+        const source = job.source || 'N/A';
+        const link = job.url ? `[View](${job.url})` : 'N/A';
+        markdown += `| ${company} | ${industry} | ${title} ${link} | ${posted} | ${source} |\n`;
+      }
+      markdown += `\n`;
+    }
+    
+    if (dedupedJobs.length > 0) {
+      markdown += `**All Jobs (${dedupedJobs.length})**\n\n`;
+      markdown += `| Company | Industry | Position | Posted | Source | URL |\n`;
+      markdown += `|---------|----------|----------|--------|--------|-----|\n`;
+      for (const job of dedupedJobs) {
+        const company = job.company || 'N/A';
+        const industry = classifyIndustry(job.company || '');
+        const title = job.title || 'N/A';
+        const posted = job.posted_date || '';
+        const source = job.source || 'N/A';
+        const urlCell = job.url ? `[Link](${job.url})` : '';
+        const newTag = job.is_new ? ' \u2705' : '';
+        markdown += `| ${company} | ${industry} | ${title} | ${posted} | ${source}${newTag} | ${urlCell} |\n`;
+      }
+      markdown += `\n`;
+    }
+    
+    markdown += `**Summary:** ${dedupedJobs.length} total jobs, ${newJobs.length} new this run\n`;
+    
+    if (flags.updateTracking) {
+      markdown += `\uD83D\uDCC4 **Master tracking table:** \`Obsidian Vault/Job Tracking/sg-tax-master-track.md\`\n`;
+    }
+    
+    if (linkedinStatus !== 'skipped') {
+      markdown += `LinkedIn: ${linkedinStatus === 'ok' ? '\u2705 accessible' : '\u26a0\ufe0f blocked (using ' + liCount + ' known IDs)'}\n`;
+    }
+    
+    console.log(markdown);
+  } else {
+    // JSON output to stdout (for backward compatibility)
+    console.log(JSON.stringify(output, null, 2));
+  }
+  
+  if (flags.verbose) {
+    console.error(`\n[OUTPUT] Written to ${outputPath}`);
+    console.error(`[DONE] ${dedupedJobs.length} unique jobs (${newJobs.length} new)`);
+  }
+}
+
+main().then(() => {
+  process.exit(0);
+}).catch(e => {
+  console.error('FATAL:', e.message);
+  process.exit(1);
+});
