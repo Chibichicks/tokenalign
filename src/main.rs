@@ -31,7 +31,8 @@ async fn main() {
         .fallback(proxy_handler)
         .with_state(state);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
+    let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
+    let addr = SocketAddr::from(([127, 0, 0, 1], port.parse().unwrap()));
     println!("🛡️ TokenAlign v37 [Production Candidate]");
     println!("🚀 Token-Saving Gateway active on http://{}", addr);
     println!("💎 Strategy: Atomic Alignment + Structural Cache Sync");

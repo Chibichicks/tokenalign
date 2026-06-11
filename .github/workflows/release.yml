@@ -28,6 +28,9 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Build Binary
         run: cargo build --release --target ${{ matrix.target }}
+      - name: Create release directory
+        run: mkdir -p target/release
+        shell: bash
       - name: Rename binary (Windows)
         if: matrix.os == 'windows-latest'
         run: mv target/${{ matrix.target }}/release/tokenalign.exe target/release/${{ matrix.artifact_name }}

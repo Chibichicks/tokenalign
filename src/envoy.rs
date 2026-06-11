@@ -1,13 +1,21 @@
-use ax_proxy::{Request, Response, Provider}; // Hypothetical library for clean forwarding
 use serde_json::Value;
+use axum::body::Body;
+use http::header;
 
 pub async fn forward_json(parts: http::request::Parts, body: Value) -> reqwest::Response {
     let client = reqwest::Client::new();
-    let api_key = std::env::var("OPENAI_API_KEY").expect("API Key must be set in Environment");
+    let api_key = std::env::var("LLM_API_KEY").or_else(|_| std::env::var("OPENAI_API_KEY")).expect("API Key must be set");
 
-    // The Envoy process acts as a secure air-gap
-    client.post("https://api.openai.com/v1/chat/completions")
+    // Dynamic Provider Detection
+    let target_url = if body["model"].as_str().unwrap_or("").contains("claude") {
+        "https://api.anthropic.com/v1/messages"
+    } else {
+        "https://api.openai.com/v1/chat/completions"
+    };
+
+    client.post(target_url)
         .header("Authorization", format!("Bearer {}", api_key))
+        .header("anthropic-version", "2023-06-01") // Required for Claude
         .json(&body)
         .send()
         .await
