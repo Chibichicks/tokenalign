@@ -3,6 +3,7 @@ use axum::body::Body;
 use axum::http::{header, StatusCode};
 use axum::response::Response;
 use futures_util::StreamExt;
+use http_body_util::BodyExt;
 
 pub async fn forward_json(_parts: http::request::Parts, body: Value) -> reqwest::Response {
     let client = reqwest::Client::new();
@@ -27,9 +28,13 @@ pub async fn forward_raw(_parts: http::request::Parts, body: Body) -> Response {
     let api_key = std::env::var("LLM_API_KEY").or_else(|_| std::env::var("OPENAI_API_KEY")).unwrap();
     let client = reqwest::Client::new();
     
+    // Convert Axum body to Reqwest body
+    let stream = body.into_data_stream();
+    let req_body = reqwest::Body::wrap_stream(stream);
+
     let res = client.post("https://api.openai.com/v1/chat/completions")
         .header("Authorization", format!("Bearer {}", api_key))
-        .body(reqwest::Body::wrap_stream(body.into_data_stream()))
+        .body(req_body)
         .send()
         .await
         .unwrap();
@@ -41,7 +46,6 @@ async fn convert_response(res: reqwest::Response) -> Response {
     let status = StatusCode::from_u16(res.status().as_u16()).unwrap();
     let headers = res.headers().clone();
     
-    // Correct way to convert stream for Axum 0.7
     let stream = res.bytes_stream().map(|result| result.map_err(|e| e.to_string()));
     let body = Body::from_stream(stream);
     
